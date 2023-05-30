@@ -2,11 +2,11 @@ import torch
 import torch.nn as nn
 
 
-class TimeAwareConvLSTMCell(nn.Module):
+class TConvLSTMCell(nn.Module):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def __init__(self, in_channels, out_channels, kernel_size, padding, activation, frame_size):
-        super(TimeAwareConvLSTMCell, self).__init__()  
+        super(TConvLSTMCell, self).__init__()  
 
         if activation == "tanh":
             self.activation = torch.tanh 
@@ -38,7 +38,6 @@ class TimeAwareConvLSTMCell(nn.Module):
         return H, C
     
 
-
 class TConvLSTM(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, activation, frame_size, return_sequence=False):
         super(TConvLSTM, self).__init__()
@@ -46,7 +45,7 @@ class TConvLSTM(nn.Module):
         self.out_channels = out_channels
         self.return_sequence = return_sequence
         
-        self.cell = TimeAwareConvLSTMCell(in_channels, out_channels, kernel_size, padding, activation, frame_size)
+        self.cell = TConvLSTMCell(in_channels, out_channels, kernel_size, padding, activation, frame_size)
 
     def forward(self, X, durations):
         batch_size, seq_len, channels, height, width = X.size()
@@ -68,18 +67,3 @@ class TConvLSTM(nn.Module):
             output = torch.squeeze(output[:, -1, ...], dim=1)
         
         return output
-
-class TimeAwareConvLSTMAutoencoder(nn.Module):
-    def __init__(self, in_channels, hidden_channels, kernel_size, padding, activation, frame_size):
-        super(TimeAwareConvLSTMAutoencoder, self).__init__()
-        self.encoder = TimeAwareConvLSTMEncoder(in_channels, hidden_channels, kernel_size, padding, activation, frame_size)
-        self.decoder_lstm = nn.LSTM(hidden_channels, hidden_channels, batch_first=True)
-        self.decoder_conv = nn.Conv2d(hidden_channels, in_channels, kernel_size, padding=padding)
-
-    def forward(self, X, durations):
-        H, C = self.encoder(X, durations)
-        H = H.unsqueeze(1)
-        H, _ = self.decoder_lstm(H)
-        H = H.squeeze(1)
-        reconstructed_X = self.decoder_conv(H)
-        return reconstructed_X
