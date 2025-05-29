@@ -80,7 +80,41 @@ class DurationAwareConvLSTMCellTF(tf.keras.layers.Layer):
         h_next = o * tf.tanh(c_next)
 
         return h_next, [h_next, c_next]
+    
+    def compute_output_shape(self, input_shapes):
+        # input_shapes will be a tuple of shapes for the inputs to the cell's call method for a single step.
+        # In your case, input_shapes = (frames_shape_at_step, durations_shape_at_step)
+        # frames_shape_at_step is (batch_size, H, W, C_in)
+        # durations_shape_at_step is (batch_size,)
 
+        frames_shape = input_shapes[0] # Shape of input_tensor_t for one step
+        batch_size = frames_shape[0]
+        
+        # Determine spatial dimensions (H, W) from the input frames_shape.
+        # These can be None if your model supports dynamic spatial dimensions.
+        if self.data_format == 'channels_last':
+            h_dim = frames_shape[1] # Height
+            w_dim = frames_shape[2] # Width
+            return tf.TensorShape([batch_size, h_dim, w_dim, self.filters])
+        else: # channels_first
+            h_dim = frames_shape[2] # Height
+            w_dim = frames_shape[3] # Width
+            return tf.TensorShape([batch_size, self.filters, h_dim, w_dim])
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "filters": self.filters,
+            "kernel_size": self.kernel_size,
+            "data_format": self.data_format,
+            "duration_mode": self.duration_mode,
+            "batch_norm_durations": self.batch_norm_durations,
+            # Assuming duration_mlp.layers[0] is the first Dense layer
+            "duration_feature_dim": self.duration_mlp.layers[0].units if self.duration_mlp and self.duration_mlp.layers else 16, # provide default if needed
+            "exp_damping_factor": self.exp_damping_factor,
+            "epsilon": self.epsilon
+        })
+        return config
 
 # To use it with Keras RNN layer:
 # cell = DurationAwareConvLSTMCellTF(filters=64, kernel_size=(3,3), duration_mode="exp", batch_norm_durations=True)
