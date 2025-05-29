@@ -1,91 +1,93 @@
 import tensorflow as tf
 
-class DurationAwareConvLSTMCell(tf.keras.layers.Layer):
-    def __init__(self, filters, kernel_size, data_format='channels_last', duration_feature_dim=16, **kwargs):
+class DurationAwareConvLSTMCellTF(tf.keras.layers.Layer):
+    def __init__(self, filters, kernel_size, data_format='channels_last',
+                 duration_mode="log", batch_norm_durations=False,
+                 duration_feature_dim=16, exp_damping_factor=0.1, epsilon=1e-6,
+                 **kwargs):
         super().__init__(**kwargs)
         self.filters = filters
-        self.kernel_size = kernel_size
+        self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
         self.data_format = data_format
         self.state_size = [tf.TensorShape([None, None, filters]), tf.TensorShape([None, None, filters])] # h, c
+        self.epsilon = epsilon
+
+        # Duration processing settings
+        if duration_mode not in ["log", "exp"]:
+            raise ValueError("duration_mode must be 'log' or 'exp'")
+        self.duration_mode = duration_mode
+        self.batch_norm_durations = batch_norm_durations
+        self.exp_damping_factor = exp_damping_factor
 
         self.conv_gates = tf.keras.layers.Conv2D(
-            filters=4 * filters, kernel_size=kernel_size, padding='same', data_format=data_format)
+            filters=4 * filters, kernel_size=self.kernel_size, padding='same', data_format=data_format)
 
         self.duration_mlp = tf.keras.Sequential([
-            tf.keras.layers.Dense(duration_feature_dim, activation='relu'),
-            tf.keras.layers.Dense(1) # Output a single factor or `filters` for channel-wise
-        ])
+            tf.keras.layers.Dense(duration_feature_dim, activation='relu', name="duration_mlp_dense1"),
+            tf.keras.layers.Dense(1, name="duration_mlp_dense2") # Output a single scalar effect
+        ], name="duration_mlp")
+        self.channel_axis = -1 if data_format == 'channels_last' else 1
 
-    def build(self, input_shape): # input_shape is for x_t
-        if self.data_format == 'channels_first':
-            channel_axis = 1
-        else:
-            channel_axis = -1
-        # input_shape[0] is for the frame tensor
-        # input_shape[1] is for the duration scalar, we don't use it for conv kernel building.
-        if isinstance(input_shape, list): # If inputs=(frames, durations)
-            frame_shape = input_shape[0]
-        else: # Should not happen if used with RNN layer correctly
-            frame_shape = input_shape
 
-        input_dim = frame_shape[channel_axis]
-        # self.conv_gates (defined in __init__) will be built implicitly on first call
-
-    def call(self, inputs, states, training=None):
+    def call(self, inputs, states, training=None): # `training` flag from Keras
         # `inputs` will be (input_tensor_t, duration_t)
         # `states` will be [h_prev, c_prev]
         input_tensor_t, duration_t = inputs
         h_prev, c_prev = states
 
-        combined = tf.concat([input_tensor_t, h_prev], axis=-1 if self.data_format == 'channels_last' else 1)
+        combined = tf.concat([input_tensor_t, h_prev], axis=self.channel_axis)
         gates = self.conv_gates(combined)
 
-        i, f, g, o = tf.split(gates, num_or_size_splits=4, axis=-1 if self.data_format == 'channels_last' else 1)
+        i, f, g_tilde, o = tf.split(gates, num_or_size_splits=4, axis=self.channel_axis)
 
         i = tf.sigmoid(i)
         f = tf.sigmoid(f)
-        g_tilde = tf.tanh(g) # Candidate cell state
+        g = tf.tanh(g_tilde) # Candidate cell state
         o = tf.sigmoid(o)
 
-        # Process duration
-        duration_t_reshaped = tf.expand_dims(tf.cast(duration_t, tf.float32), -1) # [B, 1]
-        # duration_factor = 1.0 + tf.nn.relu(self.duration_mlp(duration_t_reshaped)) # [B, 1]
-        # For broadcasting:
-        # duration_factor = tf.reshape(duration_factor, [-1, 1, 1, 1]) # For channels_last: B,1,1,1
+        # --- Duration Processing ---
+        d_val = tf.cast(duration_t, tf.float32) # Shape: [B]
+
+        if self.batch_norm_durations:
+            # Normalize across the batch for the current timestep
+            # Note: In TF, mean/std over batch in `call` is fine for this custom logic.
+            # For standard BN layers, `training` flag controls use of running stats.
+            # Here, we always use batch stats if flag is true.
+            mean_d = tf.reduce_mean(d_val, axis=0, keepdims=True)
+            std_d = tf.math.reduce_std(d_val, axis=0, keepdims=True)
+            d_val = (d_val - mean_d) / (std_d + self.epsilon)
         
-        # Alternative simple log based:
-        duration_factor = tf.math.log(tf.cast(duration_t, tf.float32) + 1e-6) + 1.0 # [B]
-        # Reshape for broadcasting: (B, 1, 1, 1) if channels_last; (B, 1, 1, 1) actually works for both if channels is not axis 0
-        if self.data_format == 'channels_last':
-            shape = [-1, 1, 1, 1]
-        else: # channels_first
-            shape = [-1, 1, 1, 1] # This still works because factor applies to all channels
-                                   # Or use tf.expand_dims multiple times. This is safer for channels_first:
-                                   # shape = [-1, 1, 1, 1] and then tf.transpose if needed, or more simply
-            # duration_factor = tf.reshape(duration_factor, [-1, 1, 1, 1]) # B, 1, H, W for scalar multiplier.
+        mlp_input = tf.expand_dims(d_val, axis=-1) # Shape: [B, 1]
+        scalar_effect = self.duration_mlp(mlp_input, training=training) # Shape: [B, 1]
 
-        # Let's assume duration_mlp outputs a single value to scale g_tilde
-        # And ensure it's positive and doesn't explode
-        duration_scalar_effect = self.duration_mlp(duration_t_reshaped) # [B, 1]
-        # This factor scales the entire feature map g_tilde
-        _duration_factor = tf.exp(duration_scalar_effect * 0.1) # [B,1], apply some damping if needed
+        if self.duration_mode == "log":
+            duration_factor = 1.0 + tf.nn.relu(scalar_effect)
+        elif self.duration_mode == "exp":
+            duration_factor = tf.exp(scalar_effect * self.exp_damping_factor)
+
+        # Reshape factor for broadcasting: e.g., [B, 1, 1, 1]
+        # Get rank of g for robust reshaping
+        g_shape = tf.shape(g)
         if self.data_format == 'channels_last': # B, H, W, C
-            _duration_factor_reshaped = tf.reshape(_duration_factor, [-1, 1, 1, 1])
+            factor_reshaped = tf.reshape(duration_factor, [g_shape[0], 1, 1, 1])
         else: # B, C, H, W
-            _duration_factor_reshaped = tf.reshape(_duration_factor, [-1, 1, 1, 1]) # Will broadcast over C, H, W
+            factor_reshaped = tf.reshape(duration_factor, [g_shape[0], 1, 1, 1]) # Will broadcast fine
 
-        g_modified = g_tilde * _duration_factor_reshaped
+        g_modified = g * factor_reshaped
+        # --- End Duration Processing ---
 
         c_next = f * c_prev + i * g_modified
         h_next = o * tf.tanh(c_next)
 
         return h_next, [h_next, c_next]
 
-# To use it:
-# cell = DurationAwareConvLSTMCell(filters=64, kernel_size=(3,3))
+
+# To use it with Keras RNN layer:
+# cell = DurationAwareConvLSTMCellTF(filters=64, kernel_size=(3,3), duration_mode="exp", batch_norm_durations=True)
 # rnn_layer = tf.keras.layers.RNN(cell, return_sequences=True)
 #
 # # Input: sequence of frames and sequence of durations
-# # frames_input shape: (batch, seq_len, H, W, C)
-# # durations_input shape: (batch, seq_len)
+# frames_input = tf.keras.Input(shape=(None, H, W, C_in), name="frames") # B, Seq, H, W, C
+# durations_input = tf.keras.Input(shape=(None,), name="durations")      # B, Seq
 # outputs = rnn_layer((frames_input, durations_input))
+# model = tf.keras.Model(inputs=[frames_input, durations_input], outputs=outputs)
