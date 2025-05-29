@@ -27,20 +27,15 @@ def parse_datetime_flexible(date_str, time_str):
     Parses datetime string, trying with and without microseconds.
     """
     try:
-        # Try with microseconds
         return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S.%f")
     except ValueError:
-        # Try without microseconds
         return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
 
-def load_and_filter_log_data(log_filepath, chunk_size=5000): # chunk_size is illustrative for the concept
+def load_and_filter_log_data(log_filepath, chunk_size=5000):
     """
-    Reads the log file line by line (efficient for large files), 
-    filters for motion sensors (M), and parses relevant information.
+    Reads the log file line by line, filters for motion sensors (M), 
+    and parses relevant information.
     Returns a sorted list of events: (datetime_obj, sensor_id, state_str).
-    The chunk_size parameter is not directly used for reading in fixed N-line chunks here,
-    as line-by-line processing is generally more memory efficient for parsing.
-    It's kept to acknowledge the user's phrasing but the implementation reads one line at a time.
     """
     raw_events = []
     if not os.path.exists(log_filepath):
@@ -51,16 +46,15 @@ def load_and_filter_log_data(log_filepath, chunk_size=5000): # chunk_size is ill
     line_count = 0
     processed_motion_events = 0
     with open(log_filepath, 'r') as f:
-        for line in f: # Read file line by line
+        for line in f: 
             line_count += 1
             parts = line.strip().split()
             if len(parts) < 4:
-                # print(f"Skipping malformed line {line_count}: {line.strip()}")
-                continue # Skip malformed lines
+                continue 
 
             date_str, time_str, sensor_id, state_str = parts[0], parts[1], parts[2], parts[3]
 
-            if sensor_id.startswith('M'): # Filter for motion sensors
+            if sensor_id.startswith('M'): 
                 try:
                     dt_obj = parse_datetime_flexible(date_str, time_str)
                     raw_events.append((dt_obj, sensor_id, state_str.upper()))
@@ -68,7 +62,7 @@ def load_and_filter_log_data(log_filepath, chunk_size=5000): # chunk_size is ill
                 except ValueError as e:
                     print(f"Warning: Could not parse datetime for line {line_count}: {line.strip()} - {e}")
             
-            if line_count % 100000 == 0: # Optional: print progress for very large files
+            if line_count % 100000 == 0: 
                  print(f"  ... processed {line_count} lines, found {processed_motion_events} motion events.")
     
     print(f"Finished processing {line_count} lines. Total motion events found: {processed_motion_events}.")
@@ -78,113 +72,160 @@ def load_and_filter_log_data(log_filepath, chunk_size=5000): # chunk_size is ill
         return raw_events
 
     print("Sorting motion events by timestamp...")
-    raw_events.sort(key=lambda x: x[0]) # Sort by datetime
+    raw_events.sort(key=lambda x: x[0]) 
     print("Sorting complete.")
     return raw_events
 
-def create_frames_from_events(raw_events, sensor_map, grid_height, grid_width):
+def create_frames_from_events(raw_events, sensor_map, grid_height, grid_width, representation_method="last_activated"):
     """
-    Processes raw sensor events to create frames based on state changes.
-    Each frame highlights sensors that changed state at a particular time.
+    Processes raw sensor events to create frames based on the specified representation method.
+    Methods: "raw", "change_point", "last_activated" (default).
     Returns a list of dictionaries: [{'frame': np.array, 'duration': float}]
     """
     if not raw_events:
-        print("create_frames_from_events: No raw events to process.")
+        print(f"create_frames_from_events (method: {representation_method}): No raw events to process.")
         return []
 
-    sensor_last_states = {} # Stores the last known state ('ON' or 'OFF') of each sensor
-    change_events = [] # Stores {'time_sec': float, 'sensor_id': str, 'state': str}
-
-    # Determine the first timestamp from the already sorted raw_events
-    first_timestamp = raw_events[0][0]
-    print(f"First event timestamp: {first_timestamp}")
-
-    for dt_obj, sensor_id, current_state_str in raw_events:
-        time_sec = (dt_obj - first_timestamp).total_seconds()
-        
-        last_known_state = sensor_last_states.get(sensor_id, 'OFF') # Assume sensors are initially 'OFF'
-
-        if current_state_str != last_known_state:
-            # Record the change along with the new state
-            change_events.append({'time_sec': time_sec, 'sensor_id': sensor_id, 'new_state': current_state_str})
-            sensor_last_states[sensor_id] = current_state_str # Update the last known state
-            
-    if not change_events:
-        print("No state changes detected among motion sensors.")
-        return []
-    
-    # change_events are already sorted by time because raw_events were sorted.
-
-    # Group changes by their exact timestamp
-    events_by_time = {}
-    for cevent in change_events:
-        t = cevent['time_sec']
-        if t not in events_by_time:
-            events_by_time[t] = []
-        # Store sensor_id for frame generation; new_state was used to detect change
-        events_by_time[t].append(cevent['sensor_id']) 
-
+    print(f"Creating frames using '{representation_method}' representation method...")
     output_frames_data = []
-    sorted_event_times = sorted(events_by_time.keys()) # Get unique timestamps of changes
+    active_change_points_list = [] # List of (time_sec, grid_state)
+    first_event_timestamp_obj = raw_events[0][0]
 
-    print(f"Found {len(sorted_event_times)} unique timestamps with state changes.")
+    if representation_method == "raw":
+        # --- Raw Method Logic (Absolute ON/OFF state of all sensors) ---
+        current_sensor_on_off_state_dict = {sid: 'OFF' for sid in sensor_map.keys()}
+        current_master_grid_state = np.zeros((grid_height, grid_width), dtype=np.uint8)
+        last_emitted_grid_state_for_deduplication = None
 
-    for i, current_time_sec in enumerate(sorted_event_times):
-        sensors_changed_this_instant = events_by_time[current_time_sec]
-        
-        frame = np.zeros((grid_height, grid_width), dtype=np.uint8)
-        active_sensor_in_frame = False
-        for sensor_id in sensors_changed_this_instant:
-            if sensor_id in sensor_map:
+        for dt_obj, sensor_id, state_from_log_event in raw_events:
+            time_sec_from_start = (dt_obj - first_event_timestamp_obj).total_seconds()
+            if sensor_id not in sensor_map: continue
+
+            previous_on_off_state_for_this_sensor = current_sensor_on_off_state_dict[sensor_id]
+            if state_from_log_event != previous_on_off_state_for_this_sensor:
+                current_sensor_on_off_state_dict[sensor_id] = state_from_log_event
                 r, c = sensor_map[sensor_id]
-                if 0 <= r < grid_height and 0 <= c < grid_width:
-                    frame[r, c] = 1 # Mark sensor as changed in this frame
-                    active_sensor_in_frame = True
-                else:
-                    print(f"Warning: Sensor {sensor_id} coordinates ({r},{c}) are out of grid bounds ({grid_height}x{grid_width}).")
-            else:
-                # This case should be less common if SENSOR_COORDINATES is comprehensive
-                # print(f"Debug: Sensor {sensor_id} changed state but not in SENSOR_COORDINATES map.")
-                pass
+                current_master_grid_state[r, c] = 1 if state_from_log_event == 'ON' else 0
+                
+                if last_emitted_grid_state_for_deduplication is None or \
+                   not np.array_equal(current_master_grid_state, last_emitted_grid_state_for_deduplication):
+                    active_change_points_list.append(
+                        (time_sec_from_start, current_master_grid_state.copy())
+                    )
+                    last_emitted_grid_state_for_deduplication = current_master_grid_state.copy()
+        
+        if not active_change_points_list and raw_events: # If no effective changes, but events existed
+            # current_master_grid_state holds the final state after all events
+            active_change_points_list.append((0.0, current_master_grid_state.copy()))
 
 
-        # Only create a frame if at least one *mapped* sensor changed state.
-        if not active_sensor_in_frame : 
-            # print(f"Debug: Skipping frame at {current_time_sec}s as no *mapped* sensors changed.")
-            continue
+    elif representation_method == "change_point":
+        # --- Change Point Method Logic (Highlight sensors that just changed state) ---
+        sensor_actual_states = {} # Tracks actual ON/OFF state to detect a change
+        events_grouped_by_time_of_change = {}
 
+        for dt_obj, sensor_id, current_state_from_log in raw_events:
+            time_sec = (dt_obj - first_event_timestamp_obj).total_seconds()
+            if sensor_id not in sensor_map: continue
+
+            last_known_actual_state = sensor_actual_states.get(sensor_id, 'OFF')
+            if current_state_from_log != last_known_actual_state:
+                sensor_actual_states[sensor_id] = current_state_from_log # Update actual state
+                if time_sec not in events_grouped_by_time_of_change:
+                    events_grouped_by_time_of_change[time_sec] = []
+                events_grouped_by_time_of_change[time_sec].append(sensor_id)
+        
+        sorted_event_times = sorted(events_grouped_by_time_of_change.keys())
+        for t_sec in sorted_event_times:
+            frame = np.zeros((grid_height, grid_width), dtype=np.uint8)
+            sensors_changed_this_instant = events_grouped_by_time_of_change[t_sec]
+            for sid in sensors_changed_this_instant:
+                if sid in sensor_map: # Should always be true due to earlier check
+                    r, c = sensor_map[sid]
+                    frame[r, c] = 1 # Mark sensor as changed
+            active_change_points_list.append((t_sec, frame))
+
+        if not active_change_points_list and raw_events: # No changes detected
+             active_change_points_list.append((0.0, np.zeros((grid_height, grid_width), dtype=np.uint8)))
+
+
+    elif representation_method == "last_activated":
+        # --- Last Activated Method Logic ---
+        current_sensor_on_off_state_dict = {sid: 'OFF' for sid in sensor_map.keys()}
+        _last_activated_sensor_id_on_grid = None # ID of sensor currently marked as 1
+        
+        # Add initial all-zeros frame at t=0 if the first activation is later
+        # This ensures the timeline starts correctly.
+        active_change_points_list.append((0.0, np.zeros((grid_height, grid_width), dtype=np.uint8)))
+
+        for dt_obj, sensor_id, state_from_log_event in raw_events:
+            time_sec = (dt_obj - first_event_timestamp_obj).total_seconds()
+            if sensor_id not in sensor_map: continue
+
+            actual_prev_on_off_state_of_sensor = current_sensor_on_off_state_dict[sensor_id]
+            current_sensor_on_off_state_dict[sensor_id] = state_from_log_event # Update true ON/OFF state
+
+            is_true_activation = (state_from_log_event == 'ON' and actual_prev_on_off_state_of_sensor == 'OFF')
+
+            if is_true_activation:
+                if sensor_id != _last_activated_sensor_id_on_grid: # A *new* sensor becomes "last activated"
+                    _last_activated_sensor_id_on_grid = sensor_id
+                    
+                    new_la_grid = np.zeros((grid_height, grid_width), dtype=np.uint8)
+                    r, c = sensor_map[_last_activated_sensor_id_on_grid]
+                    new_la_grid[r, c] = 1
+                    
+                    # Check if this new grid is different from the last one added to the list
+                    # (to handle multiple activations at the exact same timestamp if not pre-grouped)
+                    # Or, more simply, if the _last_activated_sensor_id_on_grid actually changed.
+                    # The current logic already ensures a change in _last_activated_sensor_id_on_grid.
+                    
+                    # If the new change point has the same time as the last one, update the last one.
+                    if active_change_points_list and active_change_points_list[-1][0] == time_sec:
+                        active_change_points_list[-1] = (time_sec, new_la_grid.copy())
+                    else:
+                        active_change_points_list.append((time_sec, new_la_grid.copy()))
+        
+        # Deduplicate consecutive identical frames that might arise from the initial 0.0 frame
+        # if the first activation is also at 0.0
+        if len(active_change_points_list) > 1 and active_change_points_list[0][0] == active_change_points_list[1][0] \
+           and np.array_equal(active_change_points_list[0][1], active_change_points_list[1][1]):
+            active_change_points_list.pop(0)
+        
+        # Ensure there's at least one frame if raw_events existed but no activations occurred
+        # (initial 0.0 frame would cover this if no activations, otherwise first activation is covered)
+        if not active_change_points_list and raw_events: # Should be covered by initial (0.0, zeros)
+             active_change_points_list.append((0.0, np.zeros((grid_height, grid_width), dtype=np.uint8)))
+
+
+    else:
+        raise ValueError(f"Invalid representation_method: '{representation_method}'. Choose from 'raw', 'change_point', 'last_activated'.")
+
+    # --- Common Duration Calculation and Final Frame List Generation ---
+    if not active_change_points_list:
+        print(f"Method '{representation_method}': No effective change points to form frames. Raw events count: {len(raw_events)}.")
+        return []
+
+    for i in range(len(active_change_points_list)):
+        current_time, current_grid = active_change_points_list[i]
+        
         duration = 0.0
-        if i + 1 < len(sorted_event_times):
-            next_event_time_sec = sorted_event_times[i+1]
-            duration = next_event_time_sec - current_time_sec
-        else:
-            # For the last change event, duration is until the end of the observation period (last raw event)
-            last_raw_event_time_sec = (raw_events[-1][0] - first_timestamp).total_seconds()
-            if current_time_sec < last_raw_event_time_sec:
-                duration = last_raw_event_time_sec - current_time_sec
-            else: 
-                # This change is the last one, or very close to the last raw event.
-                # Give it a default small duration if it's at the very end.
-                duration = 1.0 # Default duration for the very last frame if no further events.
+        if i + 1 < len(active_change_points_list):
+            next_time, _ = active_change_points_list[i+1]
+            duration = next_time - current_time
+        else: # Last frame in the sequence
+            last_log_event_time_sec_from_start = (raw_events[-1][0] - first_event_timestamp_obj).total_seconds()
+            if current_time < last_log_event_time_sec_from_start:
+                duration = last_log_event_time_sec_from_start - current_time
+            else: # current_time is at or beyond the last log event (e.g. if last change point is the last event)
+                duration = 1.0 # Default duration for the very last state
         
-        if duration < 0: # Should ideally not happen with sorted times
-             print(f"Warning: Negative duration ({duration}s) calculated at time {current_time_sec}s. Clamping to 0.01s.")
-             duration = 0.01 # Use a very small positive duration
-        
-        # Ensure a minimal positive duration if calculated as zero, unless it's truly instantaneous
-        # and there's another event immediately after (which the logic handles by duration to next event).
-        # This is more for the very last frame or if rounding leads to zero.
-        if duration <= 1e-6 : # If effectively zero
-            if i == len(sorted_event_times) - 1: # and it's the last frame
-                 duration = 0.01 # Fallback for the very last frame if its calculated duration is zero
-            elif sorted_event_times[i+1] - current_time_sec > 1e-6: # next event is distinctly later
-                pass # duration is correctly very small
-            else: # next event is at same time (should be grouped) or also zero duration
-                duration = 0.01
+        if duration <= 1e-6: # Ensure a minimal positive duration
+            duration = 0.01 
 
-
-        output_frames_data.append({'frame': frame, 'duration': duration})
+        output_frames_data.append({'frame': current_grid, 'duration': duration})
         
+    print(f"Method '{representation_method}': Generated {len(output_frames_data)} frames.")
     return output_frames_data
 
 def save_processed_data(frames_data, output_filepath):
@@ -227,29 +268,23 @@ def load_processed_data(npz_filepath):
 def print_frame(frame_array, sensor_coords_map, grid_h, grid_w):
     """
     Prints a string representation of the frame, showing sensor IDs and their ON/OFF status.
-    'frame_array' is the 2D numpy array for the current frame.
-    'sensor_coords_map' is the SENSOR_COORDINATES dictionary.
-    'grid_h' and 'grid_w' are the dimensions of the grid.
     """
-    # Create a reverse mapping from (row, col) to sensor_id for easier lookup
     coord_to_sensor_map = {coords: sensor_id for sensor_id, coords in sensor_coords_map.items()}
     
     print_buffer = []
     header = "Frame Status:"
     print_buffer.append(header)
-    print_buffer.append("-" * (grid_w * 12)) # Adjust multiplier for desired width
+    print_buffer.append("-" * (grid_w * 12)) 
 
     for r in range(grid_h):
         row_str = "|"
         for c in range(grid_w):
-            sensor_id_at_loc = coord_to_sensor_map.get((r, c), "----") # Get sensor ID or placeholder
-            status_val = frame_array[r, c]
+            sensor_id_at_loc = coord_to_sensor_map.get((r, c), "----") 
+            status_val = frame_array[r, c] 
             status_str = "ON" if status_val == 1 else "off"
             
-            # Format each cell to be roughly the same width for alignment
-            # Example: "M001(ON)  " or "----(off) "
             cell_str = f"{sensor_id_at_loc: <4}({status_str: >3}) |" 
-            row_str += f" {cell_str: <10}" # Adjust padding for cell width
+            row_str += f" {cell_str: <10}" 
         print_buffer.append(row_str)
     print_buffer.append("-" * (grid_w * 12))
     print("\n".join(print_buffer))
@@ -257,11 +292,8 @@ def print_frame(frame_array, sensor_coords_map, grid_h, grid_w):
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Ensure data.txt is in the same directory as the script, or provide the correct path.
     log_file = "data.txt" 
-    output_npz_file = "processed_sensor_frames.npz"
-
-    # 1. Load and filter log data
+    
     print(f"Starting log processing for {log_file}...")
     raw_sensor_events = load_and_filter_log_data(log_file)
     
@@ -270,38 +302,44 @@ if __name__ == "__main__":
     else:
         print(f"Successfully loaded and sorted {len(raw_sensor_events)} raw motion sensor events.")
         
-        # 2. Create frames based on sensor state changes
-        print("Creating frames from events...")
-        frames_with_durations = create_frames_from_events(
-            raw_sensor_events, 
-            SENSOR_COORDINATES, 
-            GRID_HEIGHT, 
-            GRID_WIDTH
-        )
-        
-        if not frames_with_durations:
-            print("No frames generated (e.g., no state changes detected for mapped sensors, or other issues).")
-        else:
-            print(f"Generated {len(frames_with_durations)} frames with durations.")
+        # --- Cycle through each representation method for demonstration ---
+        # representation_methods_to_test = ["raw", "change_point", "last_activated"]
+        representation_methods_to_test = ["last_activated"] # Default as per request, can test others
+
+        for method in representation_methods_to_test:
+            output_npz_file = f"processed_sensor_frames_{method}.npz"
+            print(f"\n--- Processing with method: {method} ---")
             
-            # 3. Save the processed data
-            save_processed_data(frames_with_durations, output_npz_file)
+            frames_with_durations = create_frames_from_events(
+                raw_sensor_events, 
+                SENSOR_COORDINATES, 
+                GRID_HEIGHT, 
+                GRID_WIDTH,
+                representation_method=method
+            )
             
-            # 4. Example of loading the data back
-            print(f"\nLoading data back from {output_npz_file} for verification...")
-            loaded_data = load_processed_data(output_npz_file)
-            
-            if loaded_data:
-                print(f"Successfully loaded {len(loaded_data)} (frame, duration) pairs.")
-                
-                # Example of using print_frame for the first few loaded frames
-                print("\n--- Sample of Loaded Data with print_frame ---")
-                for i, (frame, duration) in enumerate(loaded_data[:min(20, len(loaded_data))]): # Print first 3 frames
-                    print(f"\nLoaded Frame {i}: duration = {duration:.3f}s")
-                    print_frame(frame, SENSOR_COORDINATES, GRID_HEIGHT, GRID_WIDTH)
-                    if i >= 19: # Limit to 3 frames for brevity in output
-                        break 
-                print("--- End of Sample ---")
+            if not frames_with_durations:
+                print(f"No frames generated for method '{method}'.")
             else:
-                print("Failed to load data or no data was saved/found in the .npz file.")
-    print("Processing complete.")
+                print(f"Method '{method}': Generated {len(frames_with_durations)} frames with durations.")
+                save_processed_data(frames_with_durations, output_npz_file)
+                
+                print(f"\nLoading data back from {output_npz_file} for verification (method: {method})...")
+                loaded_data = load_processed_data(output_npz_file)
+                
+                if loaded_data:
+                    print(f"Successfully loaded {len(loaded_data)} (frame, duration) pairs for method '{method}'.")
+                    
+                    # print(f"\n--- Sample of Loaded Data with print_frame (method: {method}) ---")
+                    # for i, (frame, duration) in enumerate(loaded_data[:min(5, len(loaded_data))]): # Print first 5 frames
+                    #     print(f"\nLoaded Frame {i} (method: {method}): duration = {duration:.3f}s")
+                    #     print_frame(frame, SENSOR_COORDINATES, GRID_HEIGHT, GRID_WIDTH)
+                    #     if i >= 4: 
+                    #         break 
+                    print(f"--- End of Sample (method: {method}) ---")
+                else:
+                    print(f"Failed to load data or no data was saved/found for method '{method}'.")
+            print(f"--- Finished processing method: {method} ---")
+            
+    print("\nAll processing complete.")
+
